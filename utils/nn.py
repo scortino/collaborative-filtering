@@ -111,10 +111,13 @@ class CollabLearner:
     def lr_range(self, lr):
         if isinstance(lr, float) or isinstance(lr, int):
             return [lr] * self.model.num_layers
+        if isinstance(lr, (list, tuple)):
+            return (self.model.num_layers - len(lr)) * [lr[0]] + list(lr)
         if not isinstance(lr, slice):
-            return lr
+            return r
         if lr.start:
-            return log_stepped(lr.start, lr.stop, self.model.num_layers)
+            res = log_stepped(lr.start, lr.stop, self.model.num_layers - 1)
+            return [res[0]] + res
         else:
             return np.array([lr.stop / 10] * (self.model.num_layers - 1) + [lr.stop])
 
