@@ -1,10 +1,11 @@
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from sklearn.metrics.pairwise import cosine_similarity
 
-def import_datasets():
-    ratings = pd.read_csv(r'C:\Users\Asi\Documents\Study\Marketing Analytics\Project\ml-latest-small\ratings.csv')
-    movies = pd.read_csv(r'C:\Users\Asi\Documents\Study\Marketing Analytics\Project\ml-latest-small\movies.csv')
+def import_datasets(path=Path('./data/ml-latest-small'), ratings_csv='ratings.csv', movies_csv='movies.csv'):
+    ratings = pd.read_csv(path/ratings_csv)
+    movies = pd.read_csv(path/movies_csv)
     return ratings, movies
 
 def prepare_data(ratings):
