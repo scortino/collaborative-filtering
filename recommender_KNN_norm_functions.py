@@ -1,12 +1,6 @@
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from sklearn.metrics.pairwise import cosine_similarity
-
-def import_datasets(path=Path('./data/ml-latest-small'), ratings_csv='ratings.csv', movies_csv='movies.csv'):
-    ratings = pd.read_csv(path/ratings_csv)
-    movies = pd.read_csv(path/movies_csv)
-    return ratings, movies
 
 def prepare_data(ratings):
     n_raters = ratings['userId'].nunique()
@@ -70,4 +64,3 @@ def evaluation(ratings, k, user_movie_matrix_no_NA, average_rating_of_movie, \
         sum_squared_error += (pred - rating)**2
         i += 1
     return np.sqrt(sum_squared_error/(ratings.shape[0]*p))
-
