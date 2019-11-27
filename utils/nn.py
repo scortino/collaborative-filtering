@@ -7,8 +7,8 @@ from torch import nn, optim
 
 def log_stepped(start, stop, n):
     mult = stop / start
-    step = mult ** (1 / (n - 1))
-    return np.array([start * (step ** i) for i in range(n)])
+    step = mult ** (1 / (n - 2))
+    return np.array([start] + [start * (step ** i) for i in range(n - 1)]) # same lr for embeddings
 
 def annealing_cos(start, end, pct):
     cos_out = np.cos(np.pi * pct) + 1
@@ -24,13 +24,17 @@ class CollabData:
         m_to_i = {u: i for i, u in enumerate(unique_movies)}
         self.n_movies = len(unique_movies)
 
-        X = list(map(lambda x: [u_to_i[x[0]], m_to_i[x[1]]], zip(df[cols[0]], df[cols[1]])))
+        X = np.array(list(map(lambda x: [u_to_i[x[0]], m_to_i[x[1]]], zip(df[cols[0]], df[cols[1]]))))
         y = df[cols[2]].values
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         data = dict([('train', dict()), ('val', dict())])
-        data['train']['X'], data['val']['X'], data['train']['y'], data['val']['y'] = list(map(lambda x: torch.tensor(x).to(self.device), train_test_split(X, y, test_size=test_size, random_state=random_state)))
+        try:
+            data['train']['X'], data['val']['X'], data['train']['y'], data['val']['y'] = list(map(lambda x: torch.tensor(x).to(self.device), train_test_split(X, y, test_size=test_size, stratify=X[:, 0], random_state=random_state)))
+        except ValueError:
+            print("There are too few labels for at least one group to perform stratified sampling. Resorting to random sampling.")
+            data['train']['X'], data['val']['X'], data['train']['y'], data['val']['y'] = list(map(lambda x: torch.tensor(x).to(self.device), train_test_split(X, y, test_size=test_size, stratify=None, random_state=random_state)))
         self.data = data
         
         self.sizes = dict([('train', data['train']['X'].shape[0]), ('val', data['val']['X'].shape[0])])
@@ -52,15 +56,14 @@ class CollabData:
             inds = shuffled_inds[bs*i:bs*(i+1)]
             yield self.data[stage]['X'][inds, :].to(self.device), self.data[stage]['y'][inds].to(self.device)
 
-
 class EmbedNet(nn.Module):
     def __init__(self, n_users: int, n_movies: int,
-                 n_factors: int=50, embedding_dropout:float =0.02,
+                 n_factors: int=50, normalize_batches: bool=False, embedding_dropout:float =0.02,
                  hidden:list =[10], dense_dropouts:list =[0.2]):
                 
         super().__init__()
 
-        self.num_layers = 4 + len(hidden) * 3
+        self.i = 4 if normalize_batches else 3
 
         hidden = [2 * n_factors] + hidden
         dropouts = (len(hidden) - len(dense_dropouts) - 1) * [dense_dropouts[0]] + dense_dropouts
@@ -69,10 +72,15 @@ class EmbedNet(nn.Module):
         self.u = nn.Embedding(n_users, n_factors)
         self.m = nn.Embedding(n_movies, n_factors)
         self.d = nn.Dropout(embedding_dropout)
-        self.hidden_fc = nn.Sequential(*reduce(lambda x, y: x + y, [[nn.Linear(i, o), nn.ReLU(), nn.Dropout(d)] for i, o, d in zip(hidden[:-1], hidden[1:], dropouts)]))
+        if normalize_batches:
+            self.hidden_fc = nn.Sequential(*reduce(lambda x, y: x + y, [[nn.Linear(i, o), nn.BatchNorm1d(o), nn.ReLU(), nn.Dropout(d)] for i, o, d in zip(hidden[:-1], hidden[1:], dropouts)]))
+        else:
+            self.hidden_fc = nn.Sequential(*reduce(lambda x, y: x + y, [[nn.Linear(i, o), nn.ReLU(), nn.Dropout(d)] for i, o, d in zip(hidden[:-1], hidden[1:], dropouts)]))
+
         self.last_fc = nn.Linear(hidden[-1], 1)
 
-        self.flattened_modules = list(self.modules())[1:4] + list(self.modules())[5:] # TODO
+        self.flattened_learning_modules = list(self.modules())[1:3] + list(self.modules())[5::self.i] # TODO
+        self.num_learning_modules = len(self.flattened_learning_modules)
 
         self.random_weights()
 
@@ -82,7 +90,7 @@ class EmbedNet(nn.Module):
         self.m.weight.data.normal_()
         
         # Initialize weights hidden fully connected layers
-        for linear_layer in self.hidden_fc[::3]:
+        for linear_layer in self.hidden_fc[::self.i]:
             nn.init.xavier_uniform_(linear_layer.weight)
             linear_layer.bias.data.fill_(0.01)
         
@@ -98,8 +106,32 @@ class EmbedNet(nn.Module):
         out = torch.squeeze(torch.sigmoid(x) * (y_range[1] - y_range[0] + 1) + y_range[0] - 0.5)
         return out
 
+class EmbedDot(nn.Module):
+    def __init__(self, n_users: int, n_movies: int, n_factors: int=50, **kargs):
+
+        super().__init__()
+
+        self.u = nn.Embedding(n_users, n_factors)
+        self.m = nn.Embedding(n_movies, n_factors)
+        self.u_bias = nn.Embedding(n_users, 1)
+        self.m_bias = nn.Embedding(n_movies, 1)
+
+        self.flattened_learning_modules = list(self.children())
+        self.num_learning_modules = len(self.flattened_learning_modules)
+
+    def random_weights(self):
+        # Initialize embeddings and biases
+        for module in self.flattened_learning_modules:
+            module.weight.data.normal_()
+
+    def forward(self, users, movies, y_range: list=[0, 5]):
+        x = self.u(users) @ self.m(movies).T
+        x = x + torch.squeeze(self.u_bias(users)) + torch.squeeze(self.m_bias(movies))
+        out = torch.squeeze(torch.sigmoid(x) * (y_range[1] - y_range[0] + 1) + y_range[0] - 0.5)
+        return out
+
 class CollabLearner:
-    def __init__(self, data: CollabData, arch=EmbedNet, n_factors=50, opt_func=optim.AdamW, loss_func=nn.MSELoss, **kargs):
+    def __init__(self, data: CollabData, arch=EmbedNet, n_factors=50, opt_func=optim.Adam, loss_func=nn.MSELoss, normalize_batches=False, **kargs):
         self.data = data
         self.model = arch(data.n_users, data.n_movies, n_factors, **kargs).to(self.data.device)
         self.optimizer = self.init_optim(opt_func)
@@ -110,30 +142,30 @@ class CollabLearner:
 
     def lr_range(self, lr):
         if isinstance(lr, float) or isinstance(lr, int):
-            return [lr] * self.model.num_layers
+            return [lr] * self.model.num_learning_modules
         if isinstance(lr, (list, tuple)):
-            return (self.model.num_layers - len(lr)) * [lr[0]] + list(lr)
+            return (self.model.num_learning_modules - len(lr)) * [lr[0]] + list(lr)
         if not isinstance(lr, slice):
-            return r
+            return lr
         if lr.start:
-            res = log_stepped(lr.start, lr.stop, self.model.num_layers - 1)
-            return [res[0]] + res
+            return log_stepped(lr.start, lr.stop, self.model.num_learning_modules)
         else:
-            return np.array([lr.stop / 10] * (self.model.num_layers - 1) + [lr.stop])
+            return np.array([lr.stop / 10] * (self.model.num_learning_modules - 1) + [lr.stop])
 
     def init_optim(self, opt_func):
-        optimizer = opt_func([{'params': module.parameters()} for module in self.model.flattened_modules])
-        assert len(optimizer.param_groups) == self.model.num_layers
+        optimizer = opt_func([{'params': module.parameters()} for module in self.model.flattened_learning_modules])
+        # assert len(optimizer.param_groups) == self.model.num_layers
         return optimizer
 
     def set_param_per_layer(self, param_name, params):
-        self.optimizer.param_groups = [{**self.optimizer.param_groups[i], **{param_name: params[i]}} for i in range(self.model.num_layers)]
+        self.optimizer.param_groups = [{**self.optimizer.param_groups[i], **{param_name: params[i]}} for i in range(self.model.num_learning_modules)]
     
     def fit(self, epochs, lr=slice(1e-3), wd=1e-5, scheduler=None):
         self.epochs = epochs
         self.lr = self.lr_range(lr)
+        print(self.lr)
         self.set_param_per_layer('lr', self.lr)
-        self.set_param_per_layer('weight_decay', [wd] * self.model.num_layers)
+        self.set_param_per_layer('weight_decay', [wd] * self.model.num_learning_modules)
         if scheduler is None:
             scheduler = type('dummy_scheduler', (object,), {'initialize': lambda: None, 'update': lambda: None})
         scheduler.initialize()
@@ -208,12 +240,12 @@ class OneCycleScheduler:
         self.mom_schedules = self.steps((*self.moms, a1, annealing_cos), (*self.moms[::-1], a2, annealing_cos))
         self.optimizer = self.learn.optimizer
         self.learn.set_param_per_layer('lr', self.lr_schedules[0].start)
-        self.learn.set_param_per_layer('momentum', [self.mom_schedules[0].start] * self.learn.model.num_layers)
+        self.learn.set_param_per_layer('momentum', [self.mom_schedules[0].start] * self.learn.model.num_learning_modules)
         self.phase = 0 # keep count of phase we are on, one schedule per phase
 
     def update(self):
         "Change optimizer's parameters according to annealing schedule."
         self.learn.set_param_per_layer('lr', self.lr_schedules[self.phase].step())
-        self.learn.set_param_per_layer('momentum', [self.mom_schedules[self.phase].step()] * self.learn.model.num_layers)
+        self.learn.set_param_per_layer('momentum', [self.mom_schedules[self.phase].step()] * self.learn.model.num_learning_modules)
         if self.lr_schedules[self.phase].n >= self.lr_schedules[self.phase].n_iter:
             self.phase += 1 # move onto next phase
