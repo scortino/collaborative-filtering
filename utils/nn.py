@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -13,6 +14,12 @@ def log_stepped(start, stop, n):
 def annealing_cos(start, end, pct):
     cos_out = np.cos(np.pi * pct) + 1
     return end + (start-end) / 2 * cos_out
+
+def avg_loss(loss, previous_losses, beta=0.98):
+    if not len(previous_losses):
+        return loss
+    avg_loss = beta * previous_losses[-1] + (1 - beta) * loss
+    return avg_loss
 
 class CollabData:
     def __init__(self, df, cols=['userId', 'movieId', 'rating'], test_size=0.2, bs=256, random_state=None):
@@ -125,17 +132,19 @@ class EmbedDot(nn.Module):
             module.weight.data.normal_()
 
     def forward(self, users, movies, y_range: list=[0, 5]):
-        x = self.u(users) @ self.m(movies).T
-        x = x + torch.squeeze(self.u_bias(users)) + torch.squeeze(self.m_bias(movies))
+        x = self.u(users) * self.m(movies)
+        x = torch.sum(x, dim=1)
+        x += torch.squeeze(self.u_bias(users)) + torch.squeeze(self.m_bias(movies))
         out = torch.squeeze(torch.sigmoid(x) * (y_range[1] - y_range[0] + 1) + y_range[0] - 0.5)
         return out
 
 class CollabLearner:
-    def __init__(self, data: CollabData, arch=EmbedNet, n_factors=50, opt_func=optim.Adam, loss_func=nn.MSELoss, normalize_batches=False, **kargs):
+    def __init__(self, data: CollabData, arch=EmbedNet, n_factors=50, opt_func=optim.AdamW, loss_func=nn.MSELoss, normalize_batches=False, **kargs):
         self.data = data
         self.model = arch(data.n_users, data.n_movies, n_factors, **kargs).to(self.data.device)
         self.optimizer = self.init_optim(opt_func)
         self.loss_func = lambda pred, true: torch.sqrt(torch.max(torch.tensor(0.).to(self.data.device), loss_func()(pred, true)))
+        self.recorder = LossRecorder(self.data.n_batches['train'])
 
     def __repr__(self):
         return str(self.model)
@@ -163,12 +172,12 @@ class CollabLearner:
     def fit(self, epochs, lr=slice(1e-3), wd=1e-5, scheduler=None):
         self.epochs = epochs
         self.lr = self.lr_range(lr)
-        print(self.lr)
         self.set_param_per_layer('lr', self.lr)
         self.set_param_per_layer('weight_decay', [wd] * self.model.num_learning_modules)
         if scheduler is None:
             scheduler = type('dummy_scheduler', (object,), {'initialize': lambda: None, 'update': lambda: None})
         scheduler.initialize()
+        self.recorder.initialize(epochs)
         for epoch in range(epochs):
             running_loss = dict()
             for stage in ('train', 'val'):
@@ -182,7 +191,7 @@ class CollabLearner:
                         out = self.model(X_batch[:, 0], X_batch[:, 1], y_range=self.data.y_range)
                         loss = self.loss_func(out, y_batch.float())
 
-                        if stage == 'train':
+                        if train:
                             # backward
                             loss.backward()
 
@@ -192,8 +201,9 @@ class CollabLearner:
                             # update lr and moms
                             scheduler.update()
 
+                            self.recorder.update(avg_loss(loss.item(), self.recorder.losses[stage]), train)
                     running_loss[stage] += loss
-
+            self.recorder.update((running_loss[stage].item() / self.data.n_batches[stage].item()), train)
             print(f"epoch: {epoch}, train loss: {running_loss['train'] / self.data.n_batches['train']}, validation loss: {running_loss['val'] / self.data.n_batches['val']}")
 
     def fit_one_cycle(self, cycle_len, lr_max=slice(1e-3), moms=[0.95, 0.85], wd=1e-5, **kwargs):
@@ -249,3 +259,30 @@ class OneCycleScheduler:
         self.learn.set_param_per_layer('momentum', [self.mom_schedules[self.phase].step()] * self.learn.model.num_learning_modules)
         if self.lr_schedules[self.phase].n >= self.lr_schedules[self.phase].n_iter:
             self.phase += 1 # move onto next phase
+
+class LossRecorder:
+    def __init__(self, n_batches_train):
+        self.n_batches_train = n_batches_train
+
+    def initialize(self, n_epochs):
+        self.n_epochs = n_epochs
+        self.losses = dict([('train', []), ('val', [])])
+
+
+    def update(self, v, train=True):
+        k = 'train' if train else 'val'
+        self.losses[k] += [v]
+
+    def plot(self, return_fig=False):
+        fig, ax = plt.subplots(1, 1)
+        ax.set_xlabel('Batches')
+        ax.set_ylabel('Loss')
+        train_losses = self.losses['train']
+        x_train = np.arange(1, self.n_batches_train * self.n_epochs + 1)
+        ax.plot(x_train, train_losses, label='Train')
+        val_losses = self.losses['val']
+        x_val = np.arange(1, len(val_losses) + 1) * self.n_batches_train
+        ax.plot(x_val, val_losses, label='Validation')
+        ax.legend()
+        if return_fig:
+            return fig
